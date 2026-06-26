@@ -246,6 +246,11 @@
             width: 100% !important;
             height: 100% !important;
         }
+        .chart-container.has-data canvas { display: block; }
+        .chart-container.has-data .empty-state { display: none; }
+        .chart-container.no-data canvas { display: none; }
+        .chart-container.no-data .empty-state { display: flex; }
+
         .loading-overlay {
             position: absolute; top: 0; left: 0; right: 0; bottom: 0;
             display: flex; align-items: center; justify-content: center;
@@ -266,13 +271,18 @@
         @keyframes spin { to { transform: rotate(360deg); } }
 
         .empty-state {
-            position: absolute; top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
             text-align: center;
             color: var(--text-light);
         }
-        .empty-state .icon { font-size: 36px; margin-bottom: 8px; }
-        .empty-state p { font-size: 13px; }
+        .empty-state .icon { font-size: 48px; margin-bottom: 12px; opacity: 0.6; }
+        .empty-state p { font-size: 14px; color: var(--text-secondary); }
+        .empty-state .hint { font-size: 12px; color: var(--text-light); margin-top: 4px; }
 
         /* ===== Legend ===== */
         .legend-info {
@@ -371,7 +381,8 @@
             </div>
             <div class="empty-state hidden" id="emptyState">
                 <div class="icon">📊</div>
-                <p>暂无数据，请调整查询范围</p>
+                <p>暂无数据</p>
+                <div class="hint">请调整查询范围，或选择其他类目</div>
             </div>
         </div>
 
@@ -386,15 +397,35 @@
 
         // ===== 初始化 =====
         document.addEventListener('DOMContentLoaded', async () => {
-            const now = new Date();
-            const endStr = now.toISOString().split('T')[0];
-            const startStr = '2020-01-01';
-            document.getElementById('startDate').value = startStr;
-            document.getElementById('endDate').value = endStr;
-
+            // 先获取实际数据范围
+            await loadDataRange();
             await loadTree();
             loadCPI();
         });
+
+        // ===== 获取数据范围 =====
+        let dataRange = { min_date: '2020-01-01', max_date: '2020-01-31' };
+        async function loadDataRange() {
+            try {
+                const res = await fetch('/api/info');
+                const info = await res.json();
+                if (info.cpi_trend.min_date && info.cpi_trend.max_date) {
+                    dataRange.min_date = info.cpi_trend.min_date;
+                    dataRange.max_date = info.cpi_trend.max_date;
+                } else if (info.sales_clean.min_date && info.sales_clean.max_date) {
+                    dataRange.min_date = info.sales_clean.min_date;
+                    dataRange.max_date = info.sales_clean.max_date;
+                }
+                document.getElementById('baseDate').value = dataRange.min_date;
+                document.getElementById('startDate').value = dataRange.min_date;
+                document.getElementById('endDate').value = dataRange.max_date;
+                // 更新期间描述
+                document.querySelector('.sidebar-header p').textContent =
+                    `数据范围: ${dataRange.min_date} ~ ${dataRange.max_date}`;
+            } catch (e) {
+                console.warn('无法获取数据范围，使用默认值', e);
+            }
+        }
 
         // ===== 分类树 =====
         async function loadTree() {
@@ -476,8 +507,14 @@
                         toggle.classList.toggle('open');
                     }
                 }
-                if (node.level >= 2) {
+                if (node.level >= 1) {
                     selectNode(node.id, node.name, node.level);
+                    // 展开子节点
+                    const childDiv = div.querySelector('.tree-children');
+                    if (childDiv) {
+                        childDiv.classList.add('open');
+                        toggle.classList.add('open');
+                    }
                 }
             });
 
@@ -515,9 +552,10 @@
             const start = document.getElementById('startDate').value;
             const end = document.getElementById('endDate').value;
             const loading = document.getElementById('loadingIndicator');
-            const empty = document.getElementById('emptyState');
+            const container = document.querySelector('.chart-container');
+            container.classList.add('loading');
+            container.classList.remove('has-data', 'no-data');
             loading.classList.remove('hidden');
-            empty.classList.add('hidden');
 
             let url = `/api/cpi_trend?base=${base}&start=${start}&end=${end}`;
             if (currentNode) {
@@ -528,13 +566,14 @@
                 const res = await fetch(url);
                 const result = await res.json();
                 loading.classList.add('hidden');
+                container.classList.remove('loading');
 
                 const granularityMap = {day: '日', week: '周', month: '月'};
                 document.getElementById('granularityLabel').textContent =
                     `粒度: ${granularityMap[result.granularity] || result.granularity}`;
 
                 if (result.data && result.data.length > 0) {
-                    empty.classList.add('hidden');
+                    container.classList.add('has-data');
                     renderChart(result.data, result.granularity);
                     renderLegend(result.data);
                     renderDashboard(result.data);
@@ -543,7 +582,7 @@
                     document.getElementById('metaDates').textContent =
                         `周期数: ${result.data.length}`;
                 } else {
-                    empty.classList.remove('hidden');
+                    container.classList.add('no-data');
                     if (cpiChart) cpiChart.destroy();
                     cpiChart = null;
                     document.getElementById('legendInfo').innerHTML = '';
@@ -552,6 +591,8 @@
                 }
             } catch (e) {
                 loading.classList.add('hidden');
+                container.classList.remove('loading');
+                container.classList.add('no-data');
                 alert('加载失败: ' + e.message);
             }
         }

@@ -1,0 +1,18 @@
+feat: 全量 4 年数据清洗 + 带进度条一键全流程 + 前端智能范围
+
+重构:
+- 管道自包含: 不再依赖额外脚本文件，所有功能在 run.py 统一入口
+- S3 函数加载: CK 服务端直读 OSS，不再依赖 Python SDK 逐行下载
+- ProgressBar 进度条: 实时显示清洗进度、行数、ETA
+- 断点续传: 自动跳过已处理日期，重跑即续传
+- run.py full: 一键全流程(维度表→清洗→CPI→Web)
+
+前端:
+- /api/info 返回实际数据范围，默认智能匹配
+- 空状态与图表重叠修复(no-data/has-data 类切换)
+- 支持全层级类目点击(含 hierarchy=1/2)
+
+修复:
+- CPI product_category_map 包含所有层级映射
+- allow_experimental_analyzer=0 避免新分析器 FINAL 限制
+- products 表引擎 ReplacingMergeTree→MergeTree

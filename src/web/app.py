@@ -70,11 +70,13 @@ def api_cpi_trend():
 
         client = _get_client()
         rows = client.execute(f"""
-            SELECT date, laspeyres, paasche, fisher, product_count
-            FROM cpi_trend
-            WHERE date >= %(start)s AND date <= %(end)s
-              AND category_id = %(cid)s
-            ORDER BY date
+            SELECT c.date, c.laspeyres, c.paasche, c.fisher, c.product_count,
+                   cat.hierarchy
+            FROM cpi_trend c
+            LEFT JOIN categories cat ON c.category_id = cat.category_id
+            WHERE c.date >= %(start)s AND c.date <= %(end)s
+              AND c.category_id = %(cid)s
+            ORDER BY c.date
         """, {'start': start.isoformat(), 'end': end.isoformat(), 'cid': cid})
 
         data = []
@@ -85,6 +87,7 @@ def api_cpi_trend():
                 'paasche': r[2],
                 'fisher': r[3],
                 'product_count': r[4],
+                'hierarchy': r[5],
             })
 
         if data:
@@ -128,6 +131,35 @@ def api_daily_stats():
                 'promotion': r[8], 'holiday': r[9],
             })
         return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if client:
+            try: client.disconnect()
+            except: pass
+
+
+@app.route('/api/info')
+def api_info():
+    """返回系统中实际数据的日期范围"""
+    client = None
+    try:
+        client = _get_client()
+        r = client.execute("SELECT min(sale_date), max(sale_date), count(DISTINCT sale_date) FROM sales_clean")
+        min_d, max_d, days = r[0]
+        r2 = client.execute("SELECT min(date), max(date) FROM cpi_trend WHERE category_id = 0")
+        cpi_min, cpi_max = r2[0]
+        return jsonify({
+            'sales_clean': {
+                'min_date': str(min_d) if min_d else None,
+                'max_date': str(max_d) if max_d else None,
+                'days': days,
+            },
+            'cpi_trend': {
+                'min_date': str(cpi_min) if cpi_min else None,
+                'max_date': str(cpi_max) if cpi_max else None,
+            }
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:

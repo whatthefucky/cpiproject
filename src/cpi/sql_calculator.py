@@ -28,7 +28,7 @@ def _s3_url(oss_key):
 
 def get_granularity(start_date, end_date):
     days = (end_date - start_date).days
-    return 'day' if days < 30 else 'week' if days < 180 else 'month'
+    return 'day' if days < 50 else 'week' if days < 180 else 'month'  # 49天内日粒度
 
 
 def _existing_cpi_dates(client):
@@ -178,7 +178,7 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
             print(f"    [CPI失败] {period_label}: {e}")
             continue
 
-        # === 所有叶子类目 CPI — 单条 SQL（JOIN 在最内层）===
+        # === 全层级类目 CPI — 单条 GROUP BY（覆盖 hierarchy=1/2/3）===
         try:
             sql_all_cats = f"""
             INSERT INTO cpi_trend (date, laspeyres, paasche, fisher, product_count, category_id, granularity)

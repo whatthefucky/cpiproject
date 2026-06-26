@@ -52,7 +52,8 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
         password=get_database_config()['password'],
         database=get_database_config()['database'],
         connect_timeout=10, send_receive_timeout=300,
-        settings={'max_query_size': 10000000}
+        settings={'max_query_size': 10000000, 'allow_experimental_analyzer': 0,
+                  'allow_experimental_query_deduplication': 0}
     )
 
     granularity = get_granularity(start_date, end_date)
@@ -177,45 +178,38 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
             print(f"    [CPI失败] {period_label}: {e}")
             continue
 
-        # === 所有叶子类目 CPI — 单条 SQL GROUP BY ===
+        # === 所有叶子类目 CPI — 单条 SQL（JOIN 在最内层）===
         try:
             sql_all_cats = f"""
             INSERT INTO cpi_trend (date, laspeyres, paasche, fisher, product_count, category_id, granularity)
             SELECT
                 '{period_label}' AS date,
-                sum_l / sum_bq AS laspeyres,
-                sum_p / sum_cq AS paasche,
-                sqrt((sum_l / sum_bq) * (sum_p / sum_cq)) AS fisher,
-                product_count,
-                p.category_id,
+                SUM(base_qty * cur_price / base_price) / SUM(base_qty) AS laspeyres,
+                SUM(cur_qty * cur_price / base_price) / SUM(cur_qty) AS paasche,
+                sqrt(laspeyres * paasche) AS fisher,
+                count() AS product_count,
+                cat.category_id,
                 '{granularity}' AS granularity
             FROM (
-                SELECT
-                    m.product_id,
-                    SUM(m.base_qty) AS sum_bq,
-                    SUM(m.cur_qty) AS sum_cq,
-                    SUM(m.cur_price / m.base_price * m.base_qty) AS sum_l,
-                    SUM(m.cur_price / m.base_price * m.cur_qty) AS sum_p,
-                    count() AS product_count
+                SELECT b.product_id, b.base_price, b.base_qty,
+                       c.cur_price, c.cur_qty
                 FROM (
-                    SELECT b.product_id, b.base_price, b.base_qty, c.cur_price, c.cur_qty
-                    FROM (
-                        SELECT product_id, AVG(price) AS base_price, SUM(sales_volume) AS base_qty
-                        FROM sales_clean
-                        WHERE sale_date = '{base_ds}' AND is_missing = 0 AND sales_volume > 0
-                        GROUP BY product_id
-                    ) b
-                    INNER JOIN (
-                        SELECT product_id, AVG(price) AS cur_price, SUM(sales_volume) AS cur_qty
-                        FROM sales_clean
-                        WHERE {date_filter} AND is_missing = 0 AND sales_volume > 0
-                        GROUP BY product_id
-                    ) c ON b.product_id = c.product_id
-                ) m
-                GROUP BY m.product_id
-            ) agg
-            JOIN products p ON agg.product_id = p.product_id
-            GROUP BY p.category_id
+                    SELECT product_id, AVG(price) AS base_price, SUM(sales_volume) AS base_qty
+                    FROM sales_clean
+                    WHERE sale_date = '{base_ds}' AND is_missing = 0 AND sales_volume > 0
+                    GROUP BY product_id
+                ) b
+                INNER JOIN (
+                    SELECT product_id, AVG(price) AS cur_price, SUM(sales_volume) AS cur_qty
+                    FROM sales_clean
+                    WHERE {date_filter} AND is_missing = 0 AND sales_volume > 0
+                    GROUP BY product_id
+                ) c ON b.product_id = c.product_id
+            ) m
+            INNER JOIN product_category_map cat ON m.product_id = cat.product_id
+            GROUP BY cat.category_id
+            SETTINGS joined_subquery_requires_alias = 0,
+                     allow_experimental_analyzer = 0
             """
             client.execute(sql_all_cats)
             total_rows += 1

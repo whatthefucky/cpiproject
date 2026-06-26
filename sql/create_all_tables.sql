@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS dataproject.products (
     status          UInt8,
     effective_date  Date,
     expiration_date Nullable(Date)
-) ENGINE = ReplacingMergeTree()
+) ENGINE = MergeTree()
 ORDER BY (product_id, effective_date);
 
 -- 3. 原始销量暂存表（从 OSS S3 读入，清洗后清空）

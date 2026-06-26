@@ -1,0 +1,10 @@
+fix: CPI 类目 SQL 优化 + 产品表引擎修复 + 管道设置优化
+
+修复:
+- CPI 类目计算: 264 次独立 SQL 合并为单条 GROUP BY (SETTINGS 禁用新分析器)
+- products 表: ReplacingMergeTree → MergeTree (避免 JOIN FINAL 问题)
+- sql_pipeline.py: 增加 allow_experimental_analyzer=0 设置
+
+性能:
+- CPI 10天计算含217个类目: 约 30s (原方案需 264×10=2640 次 SQL)
+- 管道 单天处理含清洗+去重+回写+聚合: 约 5s

@@ -370,7 +370,7 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=30):
         database=get_database_config()['database'],
         connect_timeout=10,
         send_receive_timeout=300,  # S3 批量导入超时
-        settings={'max_insert_block_size': 100000}
+        settings={'max_insert_block_size': 100000, 'allow_experimental_analyzer': 0}
     )
 
     # 1. 初始化日历表

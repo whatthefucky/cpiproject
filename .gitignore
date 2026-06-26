@@ -1,0 +1,51 @@
+# ===== 禁止泄露敏感凭证 =====
+env/config.ini
+
+# ===== 但不屏蔽示例配置模板 =====
+!env/config.ini.example
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# 虚拟环境（整个 env/ 除例外）
+env/*
+!env/config.ini.example
+!env/README.md
+
+# .env 文件
+.env/
+
+# 本地大数据（不推送到 Git）
+ecommerce_data/
+cpi_output/
+analytics_output/
+sql/old/
+
+# 所有临时文件（AK/SK 可能残留）
+*_test*.txt
+*_test*.log
+*_debug*.py
+*_debug*.txt
+*_debug*.log
+*_check*.py
+*_check*.txt
+*_tmp*.txt
+_tmp*
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini

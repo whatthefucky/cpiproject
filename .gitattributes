@@ -1,0 +1,17 @@
+# 规范化行结束符
+* text=auto
+
+# Python 源码
+*.py text diff=python
+*.sql text
+*.ini text
+*.cfg text
+*.txt text
+
+# HTML/CSS/JS
+*.html text
+*.css text
+*.js text
+
+# CSV 数据（禁止自动转换换行符）
+*.csv -text

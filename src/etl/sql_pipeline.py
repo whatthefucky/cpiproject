@@ -4,14 +4,12 @@ SQL 清洗管道 — OSS → ClickHouse SQL 清洗 → OSS 回写
 
 一次性运行所有缺失日期，带实时进度条，自动断点续传。
 """
-import sys, os, time, re, math
+import sys, os, re, time
 from datetime import datetime, timedelta, date
-from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from clickhouse_driver import Client
 from config import get_database_config, get_oss_config
-from src.db.connection import get_oss_bucket
 
 # OSS 配置
 OSS_CFG = get_oss_config()
@@ -22,11 +20,7 @@ OSS_ENDPOINT = OSS_CFG['endpoint'].rstrip('/')
 _region_match = re.search(r'oss-([a-z]+-[a-z0-9-]+)', OSS_ENDPOINT)
 OSS_REGION = _region_match.group(0) if _region_match else 'oss-cn-hangzhou'
 OSS_SALES_PREFIX = 'ecommerce/sales/'
-OSS_CLEAN_PREFIX = 'ecommerce/sales_clean_ck/'
-OSS_CPI_PREFIX = 'ecommerce/cpi_results/'
 
-# 内网（CK 在阿里云上）
-_INTERNAL = True
 
 # 节日/促销日历（2020-2024）
 HOLIDAYS = set()
@@ -394,103 +388,3 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
     client.disconnect()
     return done, fail
 
-
-# ==================== 一键初始化维度表 ====================
-
-def _csv_to_ck(client, table, csv_path, columns):
-    """将本地 CSV 分批写入 ClickHouse"""
-    import csv
-    if not os.path.exists(csv_path):
-        print(f"  [跳过] 文件不存在: {csv_path}")
-        return 0
-    try:
-        r = client.execute(f"SELECT count() FROM {table}")
-        if r[0][0] > 0:
-            print(f"  [跳过] {table} 已有 {r[0][0]} 条数据")
-            return r[0][0]
-    except Exception:
-        pass
-    type_map = {}
-    try:
-        desc = client.execute(f"DESC TABLE {table}")
-        for row in desc:
-            type_map[row[0]] = row[1]
-    except Exception:
-        pass
-    try:
-        client.execute(f"TRUNCATE TABLE IF EXISTS {table}")
-    except Exception:
-        pass
-    total = 0
-    batch = []
-    col_list = [c.strip() for c in columns.split(',')]
-    with open(csv_path, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            vals = []
-            for c in col_list:
-                raw = row.get(c, '').strip()
-                if raw == '' or raw == 'nan':
-                    vals.append(None)
-                else:
-                    ctype = type_map.get(c, 'String')
-                    is_date = 'Date' in ctype and 'DateTime' not in ctype
-                    if is_date:
-                        try:
-                            vals.append(datetime.strptime(raw[:10], '%Y-%m-%d').date())
-                        except (ValueError, TypeError):
-                            vals.append(None)
-                    elif 'Int' in ctype or 'UInt' in ctype:
-                        try:
-                            vals.append(int(float(raw)))
-                        except (ValueError, TypeError):
-                            vals.append(None)
-                    elif 'Float' in ctype:
-                        try:
-                            vals.append(float(raw))
-                        except (ValueError, TypeError):
-                            vals.append(None)
-                    else:
-                        vals.append(raw)
-            batch.append(tuple(vals))
-            if len(batch) >= 50000:
-                client.execute(f'INSERT INTO {table} ({columns}) VALUES', batch)
-                total += len(batch)
-                batch = []
-        if batch:
-            client.execute(f'INSERT INTO {table} ({columns}) VALUES', batch)
-            total += len(batch)
-    print(f"  [OK] {table}: {total} 条")
-    return total
-
-
-def init_dimension_tables():
-    """初始化维度表（categories, products）"""
-    client = Client(
-        host=get_database_config()['host'],
-        port=get_database_config()['port'],
-        user=get_database_config()['user'],
-        password=get_database_config()['password'],
-        database=get_database_config()['database'],
-        connect_timeout=10, send_receive_timeout=60
-    )
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ecommerce_data')
-    cat_path = os.path.join(data_dir, 'categories.csv')
-    _csv_to_ck(client, 'categories', cat_path, 'category, category_id, hierarchy, weight, price, parent')
-    prod_path = os.path.join(data_dir, 'products.csv')
-    _csv_to_ck(client, 'products', prod_path, 'product_id, name, category_id, price, weight, status, effective_date, expiration_date')
-    client.disconnect()
-
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='SQL 清洗管道')
-    parser.add_argument('--start', default='2020-01-01')
-    parser.add_argument('--end', default='2024-12-31')
-    parser.add_argument('--batch', type=int, default=50)
-    parser.add_argument('--init-dims', action='store_true')
-    args = parser.parse_args()
-    if args.init_dims:
-        init_dimension_tables()
-    else:
-        run_sql_pipeline(start_date=args.start, end_date=args.end, batch_size=args.batch)

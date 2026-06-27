@@ -30,10 +30,8 @@ def get_config():
     return cfg
 
 
-def get_database_config(env='local'):
-    """快捷获取数据库配置
-    env: 'local' 或 'cloud'
-    """
+def get_database_config():
+    """快捷获取数据库配置"""
     cfg = get_config()
     section = 'database'
     return {
@@ -56,10 +54,3 @@ def get_oss_config():
         'access_key_secret': cfg.get(section, 'access_key_secret'),
         'prefix': cfg.get(section, 'prefix'),
     }
-
-
-if __name__ == '__main__':
-    # 测试配置是否可读
-    cfg = get_config()
-    print(f"数据库配置: {get_database_config()}")
-    print(f"OSS配置: {get_oss_config()}")

@@ -8,26 +8,10 @@
   full = 建库建表 + 维度数据 + 4年清洗 + CPI计算 + Web
 """
 import sys, os, time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT_ROOT)
-
-
-def _progress_bar(current, total, prefix='', extra='', width=40):
-    """打印单行进度条"""
-    if total == 0:
-        return
-    pct = current / total * 100
-    filled = int(width * current / total)
-    bar = '#' * filled + '-' * (width - filled)
-    try:
-        sys.stdout.write(f"\r{prefix} [{bar}] {current}/{total} ({pct:.0f}%) | {extra}    ")
-    except UnicodeEncodeError:
-        sys.stdout.write(f"\r{prefix} [{bar}] {current}/{total} ({pct:.0f}%)    ")
-    sys.stdout.flush()
-    if current >= total:
-        sys.stdout.write('\n')
 
 
 def cmd_test(args):
@@ -63,7 +47,7 @@ def cmd_init_dims(args):
 
 
 def cmd_pipeline(args):
-    """SQL 清洗管道：oss() 内网直读 OSS，单条 SQL 完成清洗"""
+    """SQL 清洗管道：oss() 内网直读 OSS"""
     print("=" * 50)
     print("SQL 清洗管道 (oss() 内网直读 + 异常检测)")
     print("=" * 50)
@@ -145,7 +129,7 @@ def main():
 示例:
   run.py test                       # 测试连接
   run.py init-dims                  # 初始化数据库（建库+建表+维度数据）
-  run.py pipeline                   # SQL 清洗全部（S3 直写，跳过 staging）
+  run.py pipeline                   # SQL 清洗全部（oss() 内网直读）
   run.py cpi --start 2020-01-01     # CPI 计算
   run.py web --port 5050            # 启动 Web
   run.py full                       # ★ 一键全流程（新实例只需这个）

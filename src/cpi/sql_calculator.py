@@ -3,27 +3,14 @@ SQL CPI 计算模块 — 直接在 ClickHouse 中用 SQL 计算费雪指数
 拉氏 = Σ(Pi/Pi0 × qi0) / Σ(qi0)    基期加权
 帕氏 = Σ(Pi/Pi0 × qit) / Σ(qit)    当期加权
 费雪 = √(拉氏 × 帕氏)              几何平均
-结果写回 CK cpi_trend + 导出 OSS
+结果写回 CK cpi_trend
 """
 import sys, os, re
 from datetime import datetime, timedelta, date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from clickhouse_driver import Client
-from config import get_database_config, get_oss_config
-
-OSS_CFG = get_oss_config()
-OSS_AK = OSS_CFG['access_key_id']
-OSS_SK = OSS_CFG['access_key_secret']
-OSS_BUCKET = OSS_CFG['bucket']
-OSS_ENDPOINT = OSS_CFG['endpoint'].rstrip('/')
-_region_match = re.search(r'oss-([a-z]+-[a-z0-9-]+)', OSS_ENDPOINT)
-OSS_REGION = _region_match.group(0) if _region_match else 'oss-cn-hangzhou'
-OSS_CPI_PREFIX = 'ecommerce/cpi_results/'
-
-
-def _s3_url(oss_key):
-    return f"https://{OSS_BUCKET}.{OSS_REGION}.aliyuncs.com/{oss_key}"
+from config import get_database_config
 
 
 def get_granularity(start_date, end_date):
@@ -219,40 +206,6 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
         if (p_idx + 1) % 10 == 0 or p_idx == 0 or p_idx == len(pending) - 1:
             print(f"    [{p_idx+1}/{len(pending)}] {period_label} OK (累计{total_periods}周期)")
 
-    # === 总体 CPI 趋势导出到 OSS（供 Web 读取）===
-    try:
-        oss_key = f"{OSS_CPI_PREFIX}cpi_trend.csv"
-        url = _s3_url(oss_key)
-        export_sql = f"""
-        INSERT INTO FUNCTION s3('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames',
-            'date Date, laspeyres Nullable(Float64), paasche Nullable(Float64), '
-            'fisher Float64, product_count UInt32, category_id UInt64, granularity String')
-        SELECT date, laspeyres, paasche, fisher, product_count, category_id, granularity
-        FROM cpi_trend
-        WHERE date >= '{start_date.isoformat()}' AND date <= '{end_date.isoformat()}'
-        ORDER BY date, category_id
-        """
-        client.execute(export_sql)
-        print(f"  [OSS导出] {oss_key}")
-    except Exception as e:
-        print(f"  [OSS导出跳过] {e}")
-
     r = client.execute("SELECT count() FROM cpi_trend")
     print(f"\n  [完成] cpi_trend 共 {r[0][0]} 行 ({total_periods} 周期)")
     client.disconnect()
-
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='SQL CPI 计算')
-    parser.add_argument('--base', default='2020-01-01', help='基期')
-    parser.add_argument('--start', help='开始日期')
-    parser.add_argument('--end', help='结束日期')
-    parser.add_argument('--force', action='store_true', help='强制重新计算')
-    args = parser.parse_args()
-
-    base = datetime.strptime(args.base, '%Y-%m-%d').date()
-    start = datetime.strptime(args.start, '%Y-%m-%d').date() if args.start else base
-    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
-
-    compute_cpi_sql(base, start, end, force=args.force)

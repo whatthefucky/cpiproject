@@ -3,7 +3,7 @@ Flask Web 可视化应用
 - /api/categories — 分类树
 - /api/cpi_trend — 直接从 cpi_trend 表读取已计算的 CPI 趋势（SQL 管道输出）
 """
-import sys, os, math, traceback
+import sys, os, traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from flask import Flask, jsonify, request, send_from_directory

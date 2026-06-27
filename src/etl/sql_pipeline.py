@@ -220,61 +220,81 @@ def _s3_url_public(oss_key):
     return f"{base}/{oss_key}"
 
 
-# ==================== 优化管道：跳过 staging，单 SQL 直写 ====================
+# ==================== 优化管道：Python SDK 直写（S3 函数在 CK 无出网权限时降级）====================
+
+_S3_WORKS = None  # 缓存 S3 检测结果，避免重复尝试
+
+
+def _check_s3_works(client):
+    """检测 S3 函数是否可用（只测一次，缓存结果）"""
+    global _S3_WORKS
+    if _S3_WORKS is not None:
+        return _S3_WORKS
+    try:
+        client.execute(
+            "SELECT count() FROM s3('https://dataproject323.oss-cn-hangzhou.aliyuncs.com/"
+            "ecommerce/sales/2020-01-01.csv', "
+            "'your_oss_ak_id', 'your_oss_ak_secret', 'CSVWithNames')",
+            settings={'max_execution_time': 5}  # 5秒超时
+        )
+        _S3_WORKS = True
+        return True
+    except Exception:
+        _S3_WORKS = False
+        return False
+
 
 def _clean_and_insert_single(client, ds, base_ds):
     """
-    单条 SQL 完成：S3 读取 + 日历标记 + 14天基线 + 异常检测
-    直接写入 sales_clean，不经过 staging 表
-    先试内网 OSS endpoint，失败降级到外网
-    返回 (行数, 成功与否)
+    加载单天数据并清洗：
+    - S3 函数可用 → S3 直写 sales_clean（最快）
+    - S3 不可用 → Python SDK + staging 中转
     """
-    from datetime import date
+    from datetime import date as dt_date
     d = datetime.strptime(ds, '%Y-%m-%d').date()
     bs = (d - timedelta(days=15)).isoformat()
     be = (d - timedelta(days=1)).isoformat()
     oss_path = OSS_SALES_PREFIX + f"{ds}.csv"
 
-    for url_fn in [_s3_url, _s3_url_public]:
-        url = url_fn(oss_path)
-        sql = f"""
-        INSERT INTO sales_clean
-        SELECT
-            s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
-            multiIf(
-                s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
-                c.day_type = 'holiday' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
-                c.day_type = 'promotion' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
-                c.day_type = 'holiday', 'holiday',
-                c.day_type = 'promotion', 'promotion',
-                c.day_type = 'weekend' AND s.sales_volume > bl.expected * {WEEKEND_THRESHOLD}, 'weekend',
-                s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
-                'normal'
-            ) AS event_type,
-            c.day_type
-        FROM s3('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames') s
-        LEFT JOIN calendar c ON s.sale_date = c.date
-        LEFT JOIN (
-            SELECT product_id, AVG(sales_volume) AS expected
-            FROM sales_clean
-            WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
-            GROUP BY product_id
-        ) bl ON s.product_id = bl.product_id
-        SETTINGS max_insert_block_size = 500000, joined_subquery_requires_alias = 0,
-                 allow_experimental_analyzer = 0
-        """
-        try:
-            client.execute(sql)
-            r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
-            return r[0][0], True
-        except Exception as e:
-            if 'internal' in url:
+    # 检测 S3 是否可用
+    if _check_s3_works(client):
+        # S3 直写
+        for url_fn in [_s3_url, _s3_url_public]:
+            url = url_fn(oss_path)
+            sql = f"""
+            INSERT INTO sales_clean
+            SELECT
+                s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
+                multiIf(
+                    s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
+                    c.day_type = 'holiday' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
+                    c.day_type = 'promotion' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
+                    c.day_type = 'holiday', 'holiday',
+                    c.day_type = 'promotion', 'promotion',
+                    c.day_type = 'weekend' AND s.sales_volume > bl.expected * {WEEKEND_THRESHOLD}, 'weekend',
+                    s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
+                    'normal'
+                ) AS event_type,
+                c.day_type
+            FROM s3('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames') s
+            LEFT JOIN calendar c ON s.sale_date = c.date
+            LEFT JOIN (
+                SELECT product_id, AVG(sales_volume) AS expected
+                FROM sales_clean
+                WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
+                GROUP BY product_id
+            ) bl ON s.product_id = bl.product_id
+            SETTINGS max_insert_block_size = 500000, joined_subquery_requires_alias = 0,
+                     allow_experimental_analyzer = 0
+            """
+            try:
+                client.execute(sql)
+                r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
+                return r[0][0], True
+            except Exception:
                 continue
-            else:
-                # 外网也失败，降级到 Python SDK
-                return _load_via_python_sdk(client, ds, oss_path)
 
-    # S3 全部失败，尝试 Python SDK
+    # S3 不可用或失败 → Python SDK 加载到 staging → SQL 清洗
     return _load_via_python_sdk(client, ds, oss_path)
 
 
@@ -387,6 +407,10 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
         send_receive_timeout=300,
         settings={'max_insert_block_size': 500000, 'allow_experimental_analyzer': 0}
     )
+
+    # 检测 S3 函数是否可用（运行一次，缓存结果）
+    s3_ok = _check_s3_works(client)
+    print(f"S3 函数: {'可用 ✓' if s3_ok else '不可用，走 Python SDK'}")
 
     # 扫描已有数据
     existing = set()

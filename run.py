@@ -63,9 +63,9 @@ def cmd_init_dims(args):
 
 
 def cmd_pipeline(args):
-    """SQL 清洗管道：OSS → 直接写入 sales_clean（跳过 staging）"""
+    """SQL 清洗管道：oss() 内网直读 OSS，单条 SQL 完成清洗"""
     print("=" * 50)
-    print("SQL 清洗管道 (S3 直写，跳过 staging)")
+    print("SQL 清洗管道 (oss() 内网直读 + 异常检测)")
     print("=" * 50)
     from src.etl.sql_pipeline import run_sql_pipeline
     run_sql_pipeline(
@@ -157,7 +157,7 @@ def main():
 
     subparsers.add_parser('init-dims', help='初始化数据库（建库 + 建表 + 维度数据）')
 
-    pipe_p = subparsers.add_parser('pipeline', help='SQL 清洗管道（S3 直写 sales_clean）')
+    pipe_p = subparsers.add_parser('pipeline', help='SQL 清洗管道（oss() 内网直读 OSS）')
     pipe_p.add_argument('--start', default='2020-01-01')
     pipe_p.add_argument('--end', default='2024-12-31')
     pipe_p.add_argument('--batch', type=int, default=50)

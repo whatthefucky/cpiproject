@@ -207,46 +207,50 @@ def init_database():
     print(f"  初始化完成：{time.time()-t0:.0f}s")
 
 
-# ==================== S3 URL 构建 ====================
+# ==================== OSS URL 构建 ====================
 
-def _s3_url(oss_key):
-    """尝试内网，失败时 caller 可降级到外网"""
-    base = f"https://{OSS_BUCKET}.{OSS_REGION}-internal.aliyuncs.com"
-    return f"{base}/{oss_key}"
-
-
-def _s3_url_public(oss_key):
-    """外网 OSS endpoint（S3 函数候选）"""
-    base = f"https://{OSS_BUCKET}.{OSS_REGION}.aliyuncs.com"
-    return f"{base}/{oss_key}"
+def _oss_url(oss_key):
+    """oss() 函数专用内网 HTTP URL"""
+    return f"http://{OSS_BUCKET}.{OSS_REGION}-internal.aliyuncs.com/{oss_key}"
 
 
-# ==================== 优化管道：Python SDK 直写（S3 函数在 CK 无出网权限时降级）====================
+# ==================== 优化管道：oss() 函数服务端直读（阿里云内网，极速）====================
 
-_S3_WORKS = False  # CK 实例 VPC 无出网权限，S3 函数不可用，直接走 Python SDK
-
-
-def _clean_and_insert_single(client, ds, base_ds):
+def _oss_clean_insert(client, ds):
     """
-    加载单天数据并清洗：
-    - S3 函数可用 → S3 直写 sales_clean（最快）
-    - S3 不可用 → Python SDK + staging 中转
+    两步完成：
+    1. oss() 直读 OSS → sales_staging（简单 INSERT，服务端毫秒级）
+    2. SQL 清洗 staging → sales_clean（含异常检测）
     """
-    from datetime import date as dt_date
     d = datetime.strptime(ds, '%Y-%m-%d').date()
     bs = (d - timedelta(days=15)).isoformat()
     be = (d - timedelta(days=1)).isoformat()
-    oss_path = OSS_SALES_PREFIX + f"{ds}.csv"
+    url = _oss_url(OSS_SALES_PREFIX + f"{ds}.csv")
 
-    # 检测 S3 是否可用
-    if _S3_WORKS:
-        # S3 直写
-        for url_fn in [_s3_url, _s3_url_public]:
-            url = url_fn(oss_path)
-            sql = f"""
-            INSERT INTO sales_clean
+    # Step 1: oss() 加载到 staging（不加显式类型，让 CK 自动推断）
+    try:
+        client.execute(f"""
+            INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing)
             SELECT
-                s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
+                toUInt64(trim(s.product_id)),
+                toDate(trim(s.sale_date)),
+                toNullable(toInt32(toFloat64OrZero(s.sales_volume))),
+                toFloat64OrZero(s.price),
+                toNullable(toFloat64OrZero(s.revenue)),
+                toUInt8(s.is_missing = 'true' OR s.is_missing = 'True' OR s.is_missing = '1')
+            FROM oss('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames',
+                'product_id String, sale_date String, sales_volume String, price String, revenue String, is_missing String') s
+            SETTINGS max_insert_block_size = 500000
+        """)
+    except Exception as e:
+        print(f"\n  [oss_staging失败] {ds}: {str(e)[:150]}")
+        return 0, False
+
+    # Step 2: SQL 清洗
+    try:
+        client.execute(f"""
+            INSERT INTO sales_clean
+            SELECT s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
                 multiIf(
                     s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
                     c.day_type = 'holiday' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
@@ -258,7 +262,7 @@ def _clean_and_insert_single(client, ds, base_ds):
                     'normal'
                 ) AS event_type,
                 c.day_type
-            FROM s3('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames') s
+            FROM sales_staging s
             LEFT JOIN calendar c ON s.sale_date = c.date
             LEFT JOIN (
                 SELECT product_id, AVG(sales_volume) AS expected
@@ -266,105 +270,15 @@ def _clean_and_insert_single(client, ds, base_ds):
                 WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
                 GROUP BY product_id
             ) bl ON s.product_id = bl.product_id
-            SETTINGS max_insert_block_size = 500000, joined_subquery_requires_alias = 0,
-                     allow_experimental_analyzer = 0
-            """
-            try:
-                client.execute(sql)
-                r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
-                return r[0][0], True
-            except Exception:
-                continue
-
-    # S3 不可用或失败 → Python SDK 加载到 staging → SQL 清洗
-    return _load_via_python_sdk(client, ds, oss_path)
-
-
-def _load_via_python_sdk(client, ds, oss_path):
-    """
-    Python SDK 降级加载：OSS → sales_staging → SQL 清洗 → sales_clean
-    """
-    from datetime import date as dt_date
-    try:
-        # 1. 检查是否已有数据
-        r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
-        if r[0][0] > 0:
-            return r[0][0], True
-
-        # 2. OSS 下载到 staging
-        bucket = get_oss_bucket()
-        obj = bucket.get_object(oss_path)
-        content = obj.read()
-        lines = content.decode('utf-8-sig').split('\n')
-        if not lines:
-            return 0, False
-
-        batch = []
-        for line in lines[1:]:
-            line = line.strip()
-            if not line: continue
-            vals = line.split(',')
-            while len(vals) < 6: vals.append('')
-            if len(vals) > 6: vals = vals[:6]
-            try:
-                pid = int(float(vals[0])) if vals[0] else 0
-                sd = datetime.strptime(vals[1][:10], '%Y-%m-%d').date() if vals[1][:10] else dt_date(2020, 1, 1)
-                sv = int(float(vals[2])) if vals[2] and vals[2] not in ('-1', '') else None
-                pr = float(vals[3]) if vals[3] else 0.0
-                rv = float(vals[4]) if vals[4] else None
-                im = 1 if vals[5].lower() in ('true', '1') else 0
-                batch.append((pid, sd, sv, pr, rv, im))
-            except Exception:
-                continue
-            if len(batch) >= 50000:
-                client.execute(
-                    'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
-                    batch
-                )
-                batch = []
-        if batch:
-            client.execute(
-                'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
-                batch
-            )
-
-        # 3. SQL 清洗（staging → sales_clean）
-        d = datetime.strptime(ds, '%Y-%m-%d').date()
-        bs = (d - timedelta(days=15)).isoformat()
-        be = (d - timedelta(days=1)).isoformat()
-        sql = f"""
-        INSERT INTO sales_clean
-        SELECT s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
-            multiIf(
-                s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
-                c.day_type = 'holiday' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
-                c.day_type = 'promotion' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
-                c.day_type = 'holiday', 'holiday',
-                c.day_type = 'promotion', 'promotion',
-                c.day_type = 'weekend' AND s.sales_volume > COALESCE(bl.expected, 0) * {WEEKEND_THRESHOLD}, 'weekend',
-                s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
-                'normal'
-            ) AS event_type,
-            c.day_type
-        FROM sales_staging s
-        LEFT JOIN calendar c ON s.sale_date = c.date
-        LEFT JOIN (
-            SELECT product_id, AVG(sales_volume) AS expected
-            FROM sales_clean
-            WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
-            GROUP BY product_id
-        ) bl ON s.product_id = bl.product_id
-        WHERE s.sale_date = '{ds}'
-        SETTINGS allow_experimental_analyzer = 0
-        """
-        client.execute(sql)
+            WHERE s.sale_date = '{ds}'
+            SETTINGS allow_experimental_analyzer = 0
+        """)
         client.execute('TRUNCATE TABLE sales_staging')
-
         r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
         return r[0][0], True
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        print(f"\n  [清洗失败] {ds}: {str(e)[:150]}")
+        client.execute('TRUNCATE TABLE sales_staging')
         return 0, False
 
 
@@ -416,146 +330,44 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
         client.disconnect()
         return
 
-    # 主循环（批量加载 + 攒批清洗）
-    print(f"开始清洗...")
+    # 主循环（oss() 内网直读，单条 SQL 完成加载+清洗+标记）
+    print(f"使用 oss() 内网直读 OSS...")
     bar = ProgressBar(total_pending, prefix='  清洗')
 
     total_rows = 0
     done = 0
     fail = 0
-    BATCH = 30  # 每批攒 30 天
 
-    for batch_start in range(0, total_pending, BATCH):
-        batch_dates = missing[batch_start:batch_start + BATCH]
+    for i, ds in enumerate(missing):
+        n, ok = _oss_clean_insert(client, ds)
+        if not ok:
+            fail += 1
+            bar.update(i + 1, f'失败 x{fail}')
+            continue
 
-        # ===== 阶段1：多线程并行下载到 staging =====
-        download_ok = {ds: False for ds in batch_dates}
+        total_rows += n
+        done += 1
 
-        def _download_one(ds):
-            """下载单天到 staging（独立连接，线程安全）"""
-            oss_path = OSS_SALES_PREFIX + f"{ds}.csv"
-            db_cfg = get_database_config()
-            local_client = Client(
-                host=db_cfg['host'], port=db_cfg['port'], user=db_cfg['user'],
-                password=db_cfg['password'], database=db_cfg['database'],
-                connect_timeout=10, send_receive_timeout=60,
-                settings={'max_insert_block_size': 500000}
-            )
-            try:
-                bucket = get_oss_bucket()
-                obj = bucket.get_object(oss_path)
-                content = obj.read()
-                lines = content.decode('utf-8-sig').split('\n')
-                if not lines:
-                    return ds, 0, False
-                batch = []
-                for line in lines[1:]:
-                    line = line.strip()
-                    if not line: continue
-                    vals = line.split(',')
-                    while len(vals) < 6: vals.append('')
-                    if len(vals) > 6: vals = vals[:6]
-                    try:
-                        pid = int(float(vals[0])) if vals[0] else 0
-                        sd = datetime.strptime(vals[1][:10], '%Y-%m-%d').date() if vals[1][:10] else date(2020, 1, 1)
-                        sv = int(float(vals[2])) if vals[2] and vals[2] not in ('-1', '') else None
-                        pr = float(vals[3]) if vals[3] else 0.0
-                        rv = float(vals[4]) if vals[4] else None
-                        im = 1 if vals[5].lower() in ('true', '1') else 0
-                        batch.append((pid, sd, sv, pr, rv, im))
-                    except Exception:
-                        continue
-                    if len(batch) >= 200000:
-                        local_client.execute(
-                            'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
-                            batch
-                        )
-                        batch = []
-                if batch:
-                    local_client.execute(
-                        'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
-                        batch
-                    )
-                local_client.disconnect()
-                return ds, 0, True
-            except Exception:
-                local_client.disconnect()
-                return ds, 0, False
+        # 回填 daily_stats
+        try:
+            client.execute(f"""
+                INSERT INTO daily_stats
+                SELECT sale_date, event_type, count(), uniqExact(product_id),
+                    sumIf(sales_volume, is_missing=0), sumIf(revenue, is_missing=0),
+                    countIf(is_missing=1), countIf(event_type='anomaly'),
+                    countIf(event_type='promotion'), countIf(event_type='holiday')
+                FROM sales_clean WHERE sale_date='{ds}'
+                GROUP BY sale_date, event_type
+            """)
+        except Exception:
+            pass
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(_download_one, ds): ds for ds in batch_dates}
-            for f in as_completed(futures):
-                ds, _, ok = f.result()
-                download_ok[ds] = ok
-                if not ok:
-                    fail += 1
-
-        # ===== 阶段2：每日 SQL 清洗（staging → sales_clean）=====
-        for i, ds in enumerate(batch_dates):
-            if not download_ok.get(ds, False):
-                continue  # 下载失败跳过
-
-            d = datetime.strptime(ds, '%Y-%m-%d').date()
-            bs = (d - timedelta(days=15)).isoformat()
-            be = (d - timedelta(days=1)).isoformat()
-            try:
-                sql = f"""
-                INSERT INTO sales_clean
-                SELECT s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
-                    multiIf(
-                        s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
-                        c.day_type = 'holiday' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
-                        c.day_type = 'promotion' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
-                        c.day_type = 'holiday', 'holiday',
-                        c.day_type = 'promotion', 'promotion',
-                        c.day_type = 'weekend' AND s.sales_volume > COALESCE(bl.expected, 0) * {WEEKEND_THRESHOLD}, 'weekend',
-                        s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
-                        'normal'
-                    ) AS event_type,
-                    c.day_type
-                FROM sales_staging s
-                LEFT JOIN calendar c ON s.sale_date = c.date
-                LEFT JOIN (
-                    SELECT product_id, AVG(sales_volume) AS expected
-                    FROM sales_clean
-                    WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
-                    GROUP BY product_id
-                ) bl ON s.product_id = bl.product_id
-                WHERE s.sale_date = '{ds}'
-                SETTINGS allow_experimental_analyzer = 0
-                """
-                client.execute(sql)
-
-                r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
-                n = r[0][0]
-                total_rows += n
-                done += 1
-
-                # 回填 daily_stats
-                try:
-                    client.execute(f"""
-                        INSERT INTO daily_stats
-                        SELECT sale_date, event_type, count(), uniqExact(product_id),
-                            sumIf(sales_volume, is_missing=0), sumIf(revenue, is_missing=0),
-                            countIf(is_missing=1), countIf(event_type='anomaly'),
-                            countIf(event_type='promotion'), countIf(event_type='holiday')
-                        FROM sales_clean WHERE sale_date='{ds}'
-                        GROUP BY sale_date, event_type
-                    """)
-                except Exception:
-                    pass
-            except Exception:
-                fail += 1
-
-        # 批量清洗完毕，清空 staging
-        client.execute('TRUNCATE TABLE sales_staging')
-
-        # 每批更新一次进度
-        progress = min(batch_start + BATCH, total_pending)
-        elapsed = time.time() - t0
-        rate = total_rows / elapsed if elapsed > 0 else 0
-        eta_s = (total_pending - progress) * elapsed / max(progress, 1)
-        bar.update(progress, f'+{total_rows:,}行 | {rate:.0f}行/s | ETA {eta_s/60:.0f}min')
+        # 每 20 天更新进度
+        if (i + 1) % 20 == 0 or i == 0 or i == total_pending - 1:
+            elapsed = time.time() - t0
+            rate = total_rows / elapsed if elapsed > 0 else 0
+            eta_s = (total_pending - i - 1) * elapsed / max(i + 1, 1)
+            bar.update(i + 1, f'+{total_rows:,}行 | {rate:.0f}行/s | ETA {eta_s/60:.0f}min')
 
     bar.finish(f'成功{done} 失败{fail} 累计{total_rows:,}行')
 

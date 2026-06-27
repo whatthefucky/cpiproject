@@ -1,7 +1,8 @@
-# ===== 禁止泄露敏感凭证 =====
+# ===== 敏感凭证（永远不要推送） =====
 env/config.ini
+config.ini
 
-# ===== 但不屏蔽示例配置模板 =====
+# ===== 示例配置模板（允许推送） =====
 !env/config.ini.example
 
 # Python 字节码
@@ -12,31 +13,29 @@ __pycache__/
 dist/
 build/
 
-# 虚拟环境（整个 env/ 除例外）
+# 虚拟环境
 env/*
 !env/config.ini.example
 !env/README.md
 
-# .env 文件
-.env/
-
-# 本地大数据（不推送到 Git）
+# 本地大数据目录（不在 Git 中）
 ecommerce_data/
 cpi_output/
 analytics_output/
 sql/old/
 
-# 所有临时文件（AK/SK 可能残留）
+# 临时文件
+tmp/
+_temp*/
+_temp*.py
+_temp*.txt
+*.log
 *_test*.txt
 *_test*.log
 *_debug*.py
 *_debug*.txt
-*_debug*.log
 *_check*.py
 *_check*.txt
-*_tmp*.txt
-_tmp*
-*.log
 
 # IDE
 .idea/

@@ -197,8 +197,37 @@ def init_database():
                 total += len(batch)
         print(f"  {tname}: {total} 条")
 
+    # 重建 product_category_map（全层级类目映射，供 CPI 类目级使用）
+    r = client.execute("SELECT count() FROM product_category_map")
+    if r[0][0] == 0:
+        _rebuild_product_category_map(client)
+    else:
+        print(f"  [跳过] product_category_map 已有 {r[0][0]} 条")
+
     client.disconnect()
     print(f"  初始化完成：{time.time()-t0:.0f}s")
+
+
+def _rebuild_product_category_map(client):
+    """重建类目映射表（全层级：hierarchy=1/2/3）"""
+    client.execute('TRUNCATE TABLE product_category_map')
+    client.execute('DROP TABLE IF EXISTS _cat_path')
+    client.execute('''CREATE TABLE _cat_path (category_id UInt64, ancestor_id UInt64, ancestor_name String, hierarchy UInt8)
+        ENGINE = MergeTree() ORDER BY (category_id, ancestor_id)''')
+    # h1
+    client.execute("INSERT INTO _cat_path SELECT c1.category_id, c1.category_id, c1.category, 1 FROM categories c1 WHERE c1.hierarchy = 1")
+    # h2 自身 + 父
+    client.execute("INSERT INTO _cat_path SELECT c2.category_id, c2.category_id, c2.category, 2 FROM categories c2 WHERE c2.hierarchy = 2")
+    client.execute("INSERT INTO _cat_path SELECT c2.category_id, c1.category_id, c1.category, 1 FROM categories c2 INNER JOIN categories c1 ON c2.parent = c1.category_id WHERE c2.hierarchy=2 AND c1.hierarchy=1")
+    # h3 自身 + 父 + 祖父
+    client.execute("INSERT INTO _cat_path SELECT c3.category_id, c3.category_id, c3.category, 3 FROM categories c3 WHERE c3.hierarchy = 3")
+    client.execute("INSERT INTO _cat_path SELECT c3.category_id, c2.category_id, c2.category, 2 FROM categories c3 INNER JOIN categories c2 ON c3.parent = c2.category_id WHERE c3.hierarchy=3 AND c2.hierarchy=2")
+    client.execute("INSERT INTO _cat_path SELECT c3.category_id, c1.category_id, c1.category, 1 FROM categories c3 INNER JOIN categories c2 ON c3.parent = c2.category_id INNER JOIN categories c1 ON c2.parent = c1.category_id WHERE c3.hierarchy=3 AND c2.hierarchy=2 AND c1.hierarchy=1")
+    # JOIN 产品
+    client.execute("INSERT INTO product_category_map SELECT p.product_id, ap.ancestor_id, ap.ancestor_name, '' l1, '' l2, '' l3 FROM products p INNER JOIN _cat_path ap ON p.category_id = ap.category_id SETTINGS max_insert_block_size = 500000")
+    client.execute('DROP TABLE IF EXISTS _cat_path')
+    r = client.execute('SELECT count() FROM product_category_map')
+    print(f"  product_category_map: {r[0][0]} 条")
 
 
 # ==================== OSS URL 构建 ====================

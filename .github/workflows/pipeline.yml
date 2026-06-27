@@ -1,0 +1,57 @@
+name: Ecommerce Data Pipeline
+
+on:
+  schedule:
+    # 每天 UTC 5:00 = 北京时间 13:00 自动运行一次
+    - cron: '0 5 * * *'
+  workflow_dispatch:          # 允许手动触发
+    inputs:
+      command:
+        description: '要运行的命令 (full/pipeline/cpi)'
+        required: true
+        default: 'pipeline'
+        type: choice
+        options:
+          - full
+          - pipeline
+          - cpi
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 最长 3 小时
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 写入 config.ini（从 GitHub Secrets）
+        run: |
+          mkdir -p env
+          echo "${{ secrets.CONFIG_INI }}" > env/config.ini
+
+      - name: 测试连接
+        run: python run.py test
+
+      - name: 运行全流程
+        if: ${{ github.event.inputs.command == 'full' || github.event_name == 'schedule' }}
+        run: python run.py full --start 2020-01-01 --end 2024-12-31
+
+      - name: 仅运行清洗
+        if: ${{ github.event.inputs.command == 'pipeline' }}
+        run: python run.py pipeline --start 2020-01-01 --end 2024-12-31
+
+      - name: 仅运行 CPI
+        if: ${{ github.event.inputs.command == 'cpi' }}
+        run: python run.py cpi --start 2020-01-01 --end 2024-12-31 --force

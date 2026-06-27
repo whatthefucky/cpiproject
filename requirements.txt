@@ -1,0 +1,4 @@
+clickhouse-driver>=0.2.6
+flask>=2.0
+oss2>=2.18
+urllib3>=1.26

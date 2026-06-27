@@ -6,6 +6,7 @@ SQL 清洗管道 — OSS → ClickHouse SQL 清洗 → OSS 回写
 """
 import sys, os, time, re, math
 from datetime import datetime, timedelta, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from clickhouse_driver import Client
@@ -140,7 +141,7 @@ def init_database():
 
     # 维度表
     import csv
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ecommerce_data')
+    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'ecommerce_data')
     for tname, csv_name, cols in [
         ('categories', 'categories.csv', 'category, category_id, hierarchy, weight, price, parent'),
         ('products', 'products.csv', 'product_id, name, category_id, price, weight, status, effective_date, expiration_date'),
@@ -222,26 +223,7 @@ def _s3_url_public(oss_key):
 
 # ==================== 优化管道：Python SDK 直写（S3 函数在 CK 无出网权限时降级）====================
 
-_S3_WORKS = None  # 缓存 S3 检测结果，避免重复尝试
-
-
-def _check_s3_works(client):
-    """检测 S3 函数是否可用（只测一次，缓存结果）"""
-    global _S3_WORKS
-    if _S3_WORKS is not None:
-        return _S3_WORKS
-    try:
-        client.execute(
-            "SELECT count() FROM s3('https://dataproject323.oss-cn-hangzhou.aliyuncs.com/"
-            "ecommerce/sales/2020-01-01.csv', "
-            "'your_oss_ak_id', 'your_oss_ak_secret', 'CSVWithNames')",
-            settings={'max_execution_time': 5}  # 5秒超时
-        )
-        _S3_WORKS = True
-        return True
-    except Exception:
-        _S3_WORKS = False
-        return False
+_S3_WORKS = False  # CK 实例 VPC 无出网权限，S3 函数不可用，直接走 Python SDK
 
 
 def _clean_and_insert_single(client, ds, base_ds):
@@ -257,7 +239,7 @@ def _clean_and_insert_single(client, ds, base_ds):
     oss_path = OSS_SALES_PREFIX + f"{ds}.csv"
 
     # 检测 S3 是否可用
-    if _check_s3_works(client):
+    if _S3_WORKS:
         # S3 直写
         for url_fn in [_s3_url, _s3_url_public]:
             url = url_fn(oss_path)
@@ -408,10 +390,6 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
         settings={'max_insert_block_size': 500000, 'allow_experimental_analyzer': 0}
     )
 
-    # 检测 S3 函数是否可用（运行一次，缓存结果）
-    s3_ok = _check_s3_works(client)
-    print(f"S3 函数: {'可用 ✓' if s3_ok else '不可用，走 Python SDK'}")
-
     # 扫描已有数据
     existing = set()
     try:
@@ -438,29 +416,122 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
         client.disconnect()
         return
 
-    # 主循环（带进度条）
+    # 主循环（批量加载 + 攒批清洗）
     print(f"开始清洗...")
     bar = ProgressBar(total_pending, prefix='  清洗')
 
     total_rows = 0
     done = 0
     fail = 0
-    daily_stats_batch = []  # 攒批写 daily_stats
+    BATCH = 30  # 每批攒 30 天
 
-    for i, ds in enumerate(missing):
-        n, ok = _clean_and_insert_single(client, ds, s.isoformat())
-        if not ok:
-            fail += 1
-            bar.update(i + 1, f'失败 x{fail}')
-            continue
+    for batch_start in range(0, total_pending, BATCH):
+        batch_dates = missing[batch_start:batch_start + BATCH]
 
-        total_rows += n
-        done += 1
-        daily_stats_batch.append(ds)
+        # ===== 阶段1：多线程并行下载到 staging =====
+        download_ok = {ds: False for ds in batch_dates}
 
-        # 攒够 30 天或最后一天，批量回填 daily_stats
-        if len(daily_stats_batch) >= 30 or i == total_pending - 1:
-            for batch_ds in daily_stats_batch:
+        def _download_one(ds):
+            """下载单天到 staging（独立连接，线程安全）"""
+            oss_path = OSS_SALES_PREFIX + f"{ds}.csv"
+            db_cfg = get_database_config()
+            local_client = Client(
+                host=db_cfg['host'], port=db_cfg['port'], user=db_cfg['user'],
+                password=db_cfg['password'], database=db_cfg['database'],
+                connect_timeout=10, send_receive_timeout=60,
+                settings={'max_insert_block_size': 500000}
+            )
+            try:
+                bucket = get_oss_bucket()
+                obj = bucket.get_object(oss_path)
+                content = obj.read()
+                lines = content.decode('utf-8-sig').split('\n')
+                if not lines:
+                    return ds, 0, False
+                batch = []
+                for line in lines[1:]:
+                    line = line.strip()
+                    if not line: continue
+                    vals = line.split(',')
+                    while len(vals) < 6: vals.append('')
+                    if len(vals) > 6: vals = vals[:6]
+                    try:
+                        pid = int(float(vals[0])) if vals[0] else 0
+                        sd = datetime.strptime(vals[1][:10], '%Y-%m-%d').date() if vals[1][:10] else date(2020, 1, 1)
+                        sv = int(float(vals[2])) if vals[2] and vals[2] not in ('-1', '') else None
+                        pr = float(vals[3]) if vals[3] else 0.0
+                        rv = float(vals[4]) if vals[4] else None
+                        im = 1 if vals[5].lower() in ('true', '1') else 0
+                        batch.append((pid, sd, sv, pr, rv, im))
+                    except Exception:
+                        continue
+                    if len(batch) >= 200000:
+                        local_client.execute(
+                            'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
+                            batch
+                        )
+                        batch = []
+                if batch:
+                    local_client.execute(
+                        'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
+                        batch
+                    )
+                local_client.disconnect()
+                return ds, 0, True
+            except Exception:
+                local_client.disconnect()
+                return ds, 0, False
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_download_one, ds): ds for ds in batch_dates}
+            for f in as_completed(futures):
+                ds, _, ok = f.result()
+                download_ok[ds] = ok
+                if not ok:
+                    fail += 1
+
+        # ===== 阶段2：每日 SQL 清洗（staging → sales_clean）=====
+        for i, ds in enumerate(batch_dates):
+            if not download_ok.get(ds, False):
+                continue  # 下载失败跳过
+
+            d = datetime.strptime(ds, '%Y-%m-%d').date()
+            bs = (d - timedelta(days=15)).isoformat()
+            be = (d - timedelta(days=1)).isoformat()
+            try:
+                sql = f"""
+                INSERT INTO sales_clean
+                SELECT s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
+                    multiIf(
+                        s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
+                        c.day_type = 'holiday' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
+                        c.day_type = 'promotion' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
+                        c.day_type = 'holiday', 'holiday',
+                        c.day_type = 'promotion', 'promotion',
+                        c.day_type = 'weekend' AND s.sales_volume > COALESCE(bl.expected, 0) * {WEEKEND_THRESHOLD}, 'weekend',
+                        s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
+                        'normal'
+                    ) AS event_type,
+                    c.day_type
+                FROM sales_staging s
+                LEFT JOIN calendar c ON s.sale_date = c.date
+                LEFT JOIN (
+                    SELECT product_id, AVG(sales_volume) AS expected
+                    FROM sales_clean
+                    WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
+                    GROUP BY product_id
+                ) bl ON s.product_id = bl.product_id
+                WHERE s.sale_date = '{ds}'
+                SETTINGS allow_experimental_analyzer = 0
+                """
+                client.execute(sql)
+
+                r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
+                n = r[0][0]
+                total_rows += n
+                done += 1
+
+                # 回填 daily_stats
                 try:
                     client.execute(f"""
                         INSERT INTO daily_stats
@@ -468,19 +539,23 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
                             sumIf(sales_volume, is_missing=0), sumIf(revenue, is_missing=0),
                             countIf(is_missing=1), countIf(event_type='anomaly'),
                             countIf(event_type='promotion'), countIf(event_type='holiday')
-                        FROM sales_clean WHERE sale_date='{batch_ds}'
+                        FROM sales_clean WHERE sale_date='{ds}'
                         GROUP BY sale_date, event_type
                     """)
                 except Exception:
                     pass
-            daily_stats_batch = []
+            except Exception:
+                fail += 1
 
-        # 每 10 天更新进度
-        if (i + 1) % 10 == 0 or i == 0 or i == total_pending - 1:
-            elapsed = time.time() - t0
-            rate = total_rows / elapsed if elapsed > 0 else 0
-            eta_s = (total_pending - i - 1) * elapsed / max(i + 1, 1)
-            bar.update(i + 1, f'+{total_rows:,}行 | {rate:.0f}行/s | ETA {eta_s/60:.0f}min')
+        # 批量清洗完毕，清空 staging
+        client.execute('TRUNCATE TABLE sales_staging')
+
+        # 每批更新一次进度
+        progress = min(batch_start + BATCH, total_pending)
+        elapsed = time.time() - t0
+        rate = total_rows / elapsed if elapsed > 0 else 0
+        eta_s = (total_pending - progress) * elapsed / max(progress, 1)
+        bar.update(progress, f'+{total_rows:,}行 | {rate:.0f}行/s | ETA {eta_s/60:.0f}min')
 
     bar.finish(f'成功{done} 失败{fail} 累计{total_rows:,}行')
 

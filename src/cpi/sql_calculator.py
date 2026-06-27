@@ -122,8 +122,8 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
         # 获取该周期对应的实际数据日期范围
         if granularity == 'month':
             ym = period_date.strftime('%Y-%m')
-            date_filter = f"sale_date LIKE '{ym}%'"
-            period_label = ym
+            date_filter = f"toYYYYMM(sale_date) = {period_date.year * 100 + period_date.month}"
+            period_label = period_date.isoformat()  # 用当月第一天 (YYYY-MM-DD)
         elif granularity == 'week':
             start_w = period_date
             end_w = period_date + timedelta(days=6)

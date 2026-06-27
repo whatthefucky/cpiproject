@@ -149,6 +149,9 @@ def api_info():
         min_d, max_d, days = r[0]
         r2 = client.execute("SELECT min(date), max(date) FROM cpi_trend WHERE category_id = 0")
         cpi_min, cpi_max = r2[0]
+        # 排除 1970-01-01（空表时的默认值）
+        cpi_min_valid = str(cpi_min) if cpi_min and str(cpi_min) != '1970-01-01' else None
+        cpi_max_valid = str(cpi_max) if cpi_max and str(cpi_max) != '1970-01-01' else None
         return jsonify({
             'sales_clean': {
                 'min_date': str(min_d) if min_d else None,
@@ -156,8 +159,8 @@ def api_info():
                 'days': days,
             },
             'cpi_trend': {
-                'min_date': str(cpi_min) if cpi_min else None,
-                'max_date': str(cpi_max) if cpi_max else None,
+                'min_date': cpi_min_valid,
+                'max_date': cpi_max_valid,
             }
         })
     except Exception as e:

@@ -209,7 +209,14 @@ def init_database():
 # ==================== S3 URL 构建 ====================
 
 def _s3_url(oss_key):
+    """尝试内网，失败时 caller 可降级到外网"""
     base = f"https://{OSS_BUCKET}.{OSS_REGION}-internal.aliyuncs.com"
+    return f"{base}/{oss_key}"
+
+
+def _s3_url_public(oss_key):
+    """外网 OSS endpoint（S3 函数候选）"""
+    base = f"https://{OSS_BUCKET}.{OSS_REGION}.aliyuncs.com"
     return f"{base}/{oss_key}"
 
 
@@ -219,48 +226,143 @@ def _clean_and_insert_single(client, ds, base_ds):
     """
     单条 SQL 完成：S3 读取 + 日历标记 + 14天基线 + 异常检测
     直接写入 sales_clean，不经过 staging 表
+    先试内网 OSS endpoint，失败降级到外网
     返回 (行数, 成功与否)
     """
-    fname = f"{ds}.csv"
-    url = _s3_url(f"ecommerce/sales/{fname}")
-    oss_path = OSS_SALES_PREFIX + fname
-    full_url = _s3_url(oss_path)
-
+    from datetime import date
     d = datetime.strptime(ds, '%Y-%m-%d').date()
     bs = (d - timedelta(days=15)).isoformat()
     be = (d - timedelta(days=1)).isoformat()
+    oss_path = OSS_SALES_PREFIX + f"{ds}.csv"
 
-    sql = f"""
-    INSERT INTO sales_clean
-    SELECT
-        s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
-        multiIf(
-            s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
-            c.day_type = 'holiday' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
-            c.day_type = 'promotion' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
-            c.day_type = 'holiday', 'holiday',
-            c.day_type = 'promotion', 'promotion',
-            c.day_type = 'weekend' AND s.sales_volume > bl.expected * {WEEKEND_THRESHOLD}, 'weekend',
-            s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
-            'normal'
-        ) AS event_type,
-        c.day_type
-    FROM s3('{full_url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames') s
-    LEFT JOIN calendar c ON s.sale_date = c.date
-    LEFT JOIN (
-        SELECT product_id, AVG(sales_volume) AS expected
-        FROM sales_clean
-        WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
-        GROUP BY product_id
-    ) bl ON s.product_id = bl.product_id
-    SETTINGS max_insert_block_size = 500000, joined_subquery_requires_alias = 0,
-             allow_experimental_analyzer = 0
+    for url_fn in [_s3_url, _s3_url_public]:
+        url = url_fn(oss_path)
+        sql = f"""
+        INSERT INTO sales_clean
+        SELECT
+            s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
+            multiIf(
+                s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
+                c.day_type = 'holiday' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
+                c.day_type = 'promotion' AND s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
+                c.day_type = 'holiday', 'holiday',
+                c.day_type = 'promotion', 'promotion',
+                c.day_type = 'weekend' AND s.sales_volume > bl.expected * {WEEKEND_THRESHOLD}, 'weekend',
+                s.sales_volume > bl.expected * {ANOMALY_THRESHOLD}, 'anomaly',
+                'normal'
+            ) AS event_type,
+            c.day_type
+        FROM s3('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames') s
+        LEFT JOIN calendar c ON s.sale_date = c.date
+        LEFT JOIN (
+            SELECT product_id, AVG(sales_volume) AS expected
+            FROM sales_clean
+            WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
+            GROUP BY product_id
+        ) bl ON s.product_id = bl.product_id
+        SETTINGS max_insert_block_size = 500000, joined_subquery_requires_alias = 0,
+                 allow_experimental_analyzer = 0
+        """
+        try:
+            client.execute(sql)
+            r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
+            return r[0][0], True
+        except Exception as e:
+            if 'internal' in url:
+                continue
+            else:
+                # 外网也失败，降级到 Python SDK
+                return _load_via_python_sdk(client, ds, oss_path)
+
+    # S3 全部失败，尝试 Python SDK
+    return _load_via_python_sdk(client, ds, oss_path)
+
+
+def _load_via_python_sdk(client, ds, oss_path):
     """
+    Python SDK 降级加载：OSS → sales_staging → SQL 清洗 → sales_clean
+    """
+    from datetime import date as dt_date
     try:
+        # 1. 检查是否已有数据
+        r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
+        if r[0][0] > 0:
+            return r[0][0], True
+
+        # 2. OSS 下载到 staging
+        bucket = get_oss_bucket()
+        obj = bucket.get_object(oss_path)
+        content = obj.read()
+        lines = content.decode('utf-8-sig').split('\n')
+        if not lines:
+            return 0, False
+
+        batch = []
+        for line in lines[1:]:
+            line = line.strip()
+            if not line: continue
+            vals = line.split(',')
+            while len(vals) < 6: vals.append('')
+            if len(vals) > 6: vals = vals[:6]
+            try:
+                pid = int(float(vals[0])) if vals[0] else 0
+                sd = datetime.strptime(vals[1][:10], '%Y-%m-%d').date() if vals[1][:10] else dt_date(2020, 1, 1)
+                sv = int(float(vals[2])) if vals[2] and vals[2] not in ('-1', '') else None
+                pr = float(vals[3]) if vals[3] else 0.0
+                rv = float(vals[4]) if vals[4] else None
+                im = 1 if vals[5].lower() in ('true', '1') else 0
+                batch.append((pid, sd, sv, pr, rv, im))
+            except Exception:
+                continue
+            if len(batch) >= 50000:
+                client.execute(
+                    'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
+                    batch
+                )
+                batch = []
+        if batch:
+            client.execute(
+                'INSERT INTO sales_staging (product_id, sale_date, sales_volume, price, revenue, is_missing) VALUES',
+                batch
+            )
+
+        # 3. SQL 清洗（staging → sales_clean）
+        d = datetime.strptime(ds, '%Y-%m-%d').date()
+        bs = (d - timedelta(days=15)).isoformat()
+        be = (d - timedelta(days=1)).isoformat()
+        sql = f"""
+        INSERT INTO sales_clean
+        SELECT s.product_id, s.sale_date, s.sales_volume, s.price, s.revenue, s.is_missing,
+            multiIf(
+                s.is_missing = 1 OR s.sales_volume IS NULL OR s.sales_volume <= 0, 'missing',
+                c.day_type = 'holiday' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
+                c.day_type = 'promotion' AND s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
+                c.day_type = 'holiday', 'holiday',
+                c.day_type = 'promotion', 'promotion',
+                c.day_type = 'weekend' AND s.sales_volume > COALESCE(bl.expected, 0) * {WEEKEND_THRESHOLD}, 'weekend',
+                s.sales_volume > COALESCE(bl.expected, 0) * {ANOMALY_THRESHOLD}, 'anomaly',
+                'normal'
+            ) AS event_type,
+            c.day_type
+        FROM sales_staging s
+        LEFT JOIN calendar c ON s.sale_date = c.date
+        LEFT JOIN (
+            SELECT product_id, AVG(sales_volume) AS expected
+            FROM sales_clean
+            WHERE sale_date BETWEEN '{bs}' AND '{be}' AND is_missing = 0 AND sales_volume > 0
+            GROUP BY product_id
+        ) bl ON s.product_id = bl.product_id
+        WHERE s.sale_date = '{ds}'
+        SETTINGS allow_experimental_analyzer = 0
+        """
         client.execute(sql)
+        client.execute('TRUNCATE TABLE sales_staging')
+
         r = client.execute(f"SELECT count() FROM sales_clean WHERE sale_date = '{ds}'")
         return r[0][0], True
-    except Exception:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return 0, False
 
 
@@ -325,7 +427,7 @@ def run_sql_pipeline(start_date=None, end_date=None, batch_size=50):
         n, ok = _clean_and_insert_single(client, ds, s.isoformat())
         if not ok:
             fail += 1
-            bar.update(i + 1, f'失败{fail}')
+            bar.update(i + 1, f'失败 x{fail}')
             continue
 
         total_rows += n

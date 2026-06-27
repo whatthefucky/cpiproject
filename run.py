@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-电商数据项目 — 统一入口（SQL 管道版）
-用法：
-    .\env\Scripts\python.exe run.py test                           # 测试连接
-    .\env\Scripts\python.exe run.py init-dims                      # 初始化维度表
-    .\env\Scripts\python.exe run.py pipeline --start 2020-01-01    # SQL 清洗（自动续传）
-    .\env\Scripts\python.exe run.py cpi --start 2020-01-01 --end 2024-12-31  # CPI 计算
-    .\env\Scripts\python.exe run.py web --port 5050                # 启动 Web
-    .\env\Scripts\python.exe run.py full                           # 一键全流程（清洗→CPI→Web）
+电商数据项目 — 统一入口（SQL 管道提速版）
+一句话运行：
+    .\env\Scripts\python.exe run.py full
+
+步骤：
+  full = 建库建表 + 维度数据 + 4年清洗 + CPI计算 + Web
 """
 import sys, os, time
 from datetime import datetime, date, timedelta
@@ -22,8 +20,11 @@ def _progress_bar(current, total, prefix='', extra='', width=40):
         return
     pct = current / total * 100
     filled = int(width * current / total)
-    bar = '█' * filled + '░' * (width - filled)
-    sys.stdout.write(f"\r{prefix} [{bar}] {current}/{total} ({pct:.0f}%) | {extra}    ")
+    bar = '#' * filled + '-' * (width - filled)
+    try:
+        sys.stdout.write(f"\r{prefix} [{bar}] {current}/{total} ({pct:.0f}%) | {extra}    ")
+    except UnicodeEncodeError:
+        sys.stdout.write(f"\r{prefix} [{bar}] {current}/{total} ({pct:.0f}%)    ")
     sys.stdout.flush()
     if current >= total:
         sys.stdout.write('\n')
@@ -52,19 +53,19 @@ def cmd_test(args):
 
 
 def cmd_init_dims(args):
-    """初始化维度表（categories, products）"""
+    """初始化整个数据库（建库 + 建表 + 维度数据）"""
     print("=" * 50)
-    print("初始化维度表（categories + products）")
+    print("初始化数据库结构与维度数据")
     print("=" * 50)
-    from src.etl.sql_pipeline import init_dimension_tables
-    init_dimension_tables()
-    print("[完成] 维度表初始化")
+    from src.etl.sql_pipeline import init_database
+    init_database()
+    print("[完成] 初始化")
 
 
 def cmd_pipeline(args):
-    """SQL 清洗管道：OSS → CK SQL 清洗 → OSS 回写"""
+    """SQL 清洗管道：OSS → 直接写入 sales_clean（跳过 staging）"""
     print("=" * 50)
-    print("SQL 清洗管道 (支持断点续传)")
+    print("SQL 清洗管道 (S3 直写，跳过 staging)")
     print("=" * 50)
     from src.etl.sql_pipeline import run_sql_pipeline
     run_sql_pipeline(
@@ -93,10 +94,10 @@ def cmd_web(args):
 
 def cmd_full(args):
     """
-    一键全流程：
-    1. 初始化维度表（如果未初始化）
-    2. SQL 清洗全部缺失天数
-    3. CPI 计算（日粒度）
+    一键全流程（推荐）：
+    1. 自动建库 + 建表 + 维度数据
+    2. SQL 清洗全部缺失天数（跳过 staging，极速）
+    3. CPI 计算（全层级类目）
     4. 启动 Web 界面
     """
     t0 = time.time()
@@ -104,10 +105,10 @@ def cmd_full(args):
     print("一键全流程启动")
     print("=" * 60)
 
-    # === Step 1: 初始化维度表 ===
-    print("\n【步骤 1/4】初始化维度表")
-    from src.etl.sql_pipeline import init_dimension_tables
-    init_dimension_tables()
+    # === Step 1: 初始化数据库（建库 + 建表 + 维度数据）===
+    print("\n【步骤 1/4】初始化数据库")
+    from src.etl.sql_pipeline import init_database
+    init_database()
 
     # === Step 2: SQL 清洗 ===
     print("\n【步骤 2/4】SQL 清洗管道")
@@ -121,8 +122,7 @@ def cmd_full(args):
     from src.cpi.sql_calculator import compute_cpi_sql
     start_d = datetime.strptime(start_str, '%Y-%m-%d').date()
     end_d = datetime.strptime(end_str, '%Y-%m-%d').date()
-    force = args.force_cpi or True
-    compute_cpi_sql(base_date=start_d, start_date=start_d, end_date=end_d, force=force)
+    compute_cpi_sql(base_date=start_d, start_date=start_d, end_date=end_d, force=True)
 
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
@@ -139,24 +139,25 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='电商数据项目 — SQL 管道版',
+        description='电商数据项目 — 一键运行（新实例只需改 config.ini + run.py full）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  %(prog)s init-dims                  # 初始化维度表
-  %(prog)s pipeline --start 2020-01-01  # SQL 清洗全量（自动续传）
-  %(prog)s cpi --start 2020-01-01 --end 2024-12-31  # CPI 计算
-  %(prog)s web --port 5050            # 启动 Web
-  %(prog)s full                       # 一键全流程（推荐）
+  run.py test                       # 测试连接
+  run.py init-dims                  # 初始化数据库（建库+建表+维度数据）
+  run.py pipeline                   # SQL 清洗全部（S3 直写，跳过 staging）
+  run.py cpi --start 2020-01-01     # CPI 计算
+  run.py web --port 5050            # 启动 Web
+  run.py full                       # ★ 一键全流程（新实例只需这个）
         """
     )
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
     subparsers.add_parser('test', help='测试 ClickHouse + OSS 连接')
 
-    subparsers.add_parser('init-dims', help='初始化维度表（categories, products）')
+    subparsers.add_parser('init-dims', help='初始化数据库（建库 + 建表 + 维度数据）')
 
-    pipe_p = subparsers.add_parser('pipeline', help='SQL 清洗管道（OSS→CK→OSS，自动续传）')
+    pipe_p = subparsers.add_parser('pipeline', help='SQL 清洗管道（S3 直写 sales_clean）')
     pipe_p.add_argument('--start', default='2020-01-01')
     pipe_p.add_argument('--end', default='2024-12-31')
     pipe_p.add_argument('--batch', type=int, default=50)
@@ -172,11 +173,10 @@ def main():
     web_p.add_argument('--port', type=int, default=5050)
     web_p.add_argument('--debug', action='store_true')
 
-    full_p = subparsers.add_parser('full', help='一键全流程：维度表→清洗→CPI→Web')
+    full_p = subparsers.add_parser('full', help='★ 一键全流程：建库→建表→维度→清洗→CPI→Web')
     full_p.add_argument('--start', default='2020-01-01')
     full_p.add_argument('--end', default='2024-12-31')
     full_p.add_argument('--port', type=int, default=5050)
-    full_p.add_argument('--force-cpi', action='store_true')
 
     args = parser.parse_args()
     if args.command is None:

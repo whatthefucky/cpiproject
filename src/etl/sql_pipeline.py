@@ -341,7 +341,11 @@ def _clean_and_export_to_oss(client, ds):
         client.execute(sql)
         return True
     except Exception as e:
-        print(f"\n  [清洗失败] {ds}: {str(e)[:150]}")
+        err_msg = str(e)
+        if 'already exists' in err_msg:
+            # OSS 文件已存在，跳过（视为成功）
+            return True
+        print(f"\n  [清洗失败] {ds}: {err_msg[:150]}")
         return False
 
 

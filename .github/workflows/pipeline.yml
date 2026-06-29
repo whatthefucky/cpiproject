@@ -34,40 +34,11 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install alibabacloud_clickhouse20191111
 
       - name: 写入 config.ini（从 GitHub Secrets）
         run: |
           mkdir -p env
           echo "${{ secrets.CONFIG_INI }}" > env/config.ini
-
-      - name: 将当前 IP 注册到 CK 白名单
-        run: |
-          IP=$(curl -s https://api.ipify.org)
-          echo "当前 Actions IP: $IP"
-
-          python -c "
-import json, os
-from alibabacloud_clickhouse20191111.client import Client as ClickHouseClient
-from alibabacloud_clickhouse20191111 import models as clickhouse_models
-from alibabacloud_tea_openapi import models as open_api_models
-
-config = open_api_models.Config(
-    access_key_id='${{ secrets.ALIYUN_AK }}',
-    access_key_secret='${{ secrets.ALIYUN_SK }}'
-)
-config.endpoint = 'clickhouse.aliyuncs.com'
-client = ClickHouseClient(config)
-
-# 添加当前 IP 到白名单
-req = clickhouse_models.ModifySecurityIPsRequest(
-    db_cluster_id='${{ secrets.CK_INSTANCE_ID }}',
-    security_iplist='${IP}',
-    group_name='github_actions'
-)
-client.modify_security_ips(req)
-print(f'IP {IP} 已添加到 CK 白名单')
-"
 
       - name: 测试连接
         run: python run.py test
@@ -79,29 +50,3 @@ print(f'IP {IP} 已添加到 CK 白名单')
             cpi) python run.py cpi --start 2020-01-01 --end 2024-12-31 --force ;;
             *) python run.py full --start 2020-01-01 --end 2024-12-31 ;;
           esac
-
-      - name: 从 CK 白名单移除当前 IP
-        if: always()  # 即使上一步失败也执行
-        run: |
-          IP=$(curl -s https://api.ipify.org)
-          python -c "
-import json, os
-from alibabacloud_clickhouse20191111.client import Client as ClickHouseClient
-from alibabacloud_clickhouse20191111 import models as clickhouse_models
-from alibabacloud_tea_openapi import models as open_api_models
-
-config = open_api_models.Config(
-    access_key_id='${{ secrets.ALIYUN_AK }}',
-    access_key_secret='${{ secrets.ALIYUN_SK }}'
-)
-config.endpoint = 'clickhouse.aliyuncs.com'
-client = ClickHouseClient(config)
-
-req = clickhouse_models.ModifySecurityIPsRequest(
-    db_cluster_id='${{ secrets.CK_INSTANCE_ID }}',
-    security_iplist='',        # 清空
-    group_name='github_actions'
-)
-client.modify_security_ips(req)
-print('github_actions 白名单组已清空')
-"

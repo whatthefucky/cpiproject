@@ -32,9 +32,13 @@ jobs:
 
       - name: 写入 config.ini（从 GitHub Secrets）
         run: |
-          if not exist env mkdir env
-          echo ${{ secrets.CONFIG_INI }} > env\config.ini
-        shell: cmd
+          import os
+          os.makedirs('env', exist_ok=True)
+          with open('env/config.ini', 'w', encoding='utf-8') as f:
+              f.write(os.environ['CONFIG_INI'])
+        shell: python
+        env:
+          CONFIG_INI: ${{ secrets.CONFIG_INI }}
 
       - name: 测试连接
         run: python run.py test

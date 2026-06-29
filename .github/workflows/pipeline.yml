@@ -28,22 +28,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+        shell: cmd
 
       - name: 写入 config.ini（从 GitHub Secrets）
         run: |
-          mkdir -p env
-          echo "${{ secrets.CONFIG_INI }}" > env/config.ini
+          if not exist env mkdir env
+          echo ${{ secrets.CONFIG_INI }} > env\config.ini
+        shell: cmd
 
       - name: 测试连接
         run: python run.py test
+        shell: cmd
 
       - name: 运行指定命令
         run: |
-          if ("${{ github.event.inputs.command }}" -eq "pipeline") {
+          if "${{ github.event.inputs.command }}"=="pipeline" (
             python run.py pipeline --start 2020-01-01 --end 2024-12-31
-          } elseif ("${{ github.event.inputs.command }}" -eq "cpi") {
+          ) else if "${{ github.event.inputs.command }}"=="cpi" (
             python run.py cpi --start 2020-01-01 --end 2024-12-31 --force
-          } else {
+          ) else (
             python run.py full --start 2020-01-01 --end 2024-12-31
-          }
-        shell: pwsh
+          )
+        shell: cmd

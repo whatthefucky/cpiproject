@@ -1,8 +1,6 @@
 name: Ecommerce Data Pipeline
 
 on:
-  schedule:
-    - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
       command:
@@ -46,11 +44,18 @@ jobs:
 
       - name: 运行指定命令
         run: |
-          if "${{ github.event.inputs.command }}"=="pipeline" (
-            python run.py pipeline --start 2020-01-01 --end 2024-12-31
-          ) else if "${{ github.event.inputs.command }}"=="cpi" (
-            python run.py cpi --start 2020-01-01 --end 2024-12-31 --force
-          ) else (
-            python run.py full --start 2020-01-01 --end 2024-12-31
-          )
-        shell: cmd
+          import os
+          cmd = os.environ.get('INPUT_COMMAND', 'full')
+          start = os.environ.get('START_DATE', '2020-01-01')
+          end = os.environ.get('END_DATE', '2024-12-31')
+          if cmd == 'pipeline':
+              os.system(f'python run.py pipeline --start {start} --end {end}')
+          elif cmd == 'cpi':
+              os.system(f'python run.py cpi --start {start} --end {end} --force')
+          else:
+              os.system(f'python run.py full --start {start} --end {end}')
+        shell: python
+        env:
+          INPUT_COMMAND: ${{ github.event.inputs.command || 'full' }}
+          START_DATE: '2020-01-01'
+          END_DATE: '2024-12-31'

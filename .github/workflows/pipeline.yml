@@ -24,15 +24,9 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
       - name: 安装依赖
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: 写入 config.ini（从 GitHub Secrets）
@@ -45,8 +39,11 @@ jobs:
 
       - name: 运行指定命令
         run: |
-          case "${{ github.event.inputs.command }}" in
-            pipeline) python run.py pipeline --start 2020-01-01 --end 2024-12-31 ;;
-            cpi) python run.py cpi --start 2020-01-01 --end 2024-12-31 --force ;;
-            *) python run.py full --start 2020-01-01 --end 2024-12-31 ;;
-          esac
+          if ("${{ github.event.inputs.command }}" -eq "pipeline") {
+            python run.py pipeline --start 2020-01-01 --end 2024-12-31
+          } elseif ("${{ github.event.inputs.command }}" -eq "cpi") {
+            python run.py cpi --start 2020-01-01 --end 2024-12-31 --force
+          } else {
+            python run.py full --start 2020-01-01 --end 2024-12-31
+          }
+        shell: pwsh

@@ -2,9 +2,8 @@ name: Ecommerce Data Pipeline
 
 on:
   schedule:
-    # 每天 UTC 5:00 = 北京时间 13:00 自动运行一次
     - cron: '0 5 * * *'
-  workflow_dispatch:          # 允许手动触发
+  workflow_dispatch:
     inputs:
       command:
         description: '要运行的命令 (full/pipeline/cpi)'
@@ -19,7 +18,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # 最长 3 小时
+    timeout-minutes: 180
 
     steps:
       - name: 检出代码

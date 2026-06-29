@@ -8,8 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from flask import Flask, jsonify, request, send_from_directory
 from datetime import datetime, date
-from clickhouse_driver import Client
-from config import get_database_config
+from src.db.connection import get_clickhouse
 
 app = Flask(__name__,
             static_folder=os.path.join(os.path.dirname(__file__), 'static'),
@@ -17,10 +16,8 @@ app = Flask(__name__,
 
 
 def _get_client():
-    db = get_database_config()
-    return Client(host=db['host'], port=db['port'], user=db['user'],
-                  password=db['password'], database=db['database'],
-                  connect_timeout=10, send_receive_timeout=30)
+    """获取 ClickHouse HTTP 连接"""
+    return get_clickhouse()
 
 
 def get_granularity(start_date, end_date):
@@ -107,36 +104,8 @@ def api_cpi_trend():
 
 @app.route('/api/daily_stats')
 def api_daily_stats():
-    """返回每日聚合统计"""
-    client = None
-    try:
-        start = request.args.get('start', '2020-01-01')
-        end = request.args.get('end', '2024-12-31')
-        client = _get_client()
-        rows = client.execute(f"""
-            SELECT sale_date, event_type, record_count, active_products,
-                   total_sales_volume, total_revenue, missing_count,
-                   anomaly_count, promotion_count, holiday_count
-            FROM daily_stats
-            WHERE sale_date >= '{start}' AND sale_date <= '{end}'
-            ORDER BY sale_date
-        """)
-        data = []
-        for r in rows:
-            data.append({
-                'date': str(r[0]), 'event_type': r[1],
-                'count': r[2], 'products': r[3],
-                'volume': r[4], 'revenue': r[5],
-                'missing': r[6], 'anomaly': r[7],
-                'promotion': r[8], 'holiday': r[9],
-            })
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    finally:
-        if client:
-            try: client.disconnect()
-            except: pass
+    """返回每日聚合统计（从 OSS 已清洗 CSV 读取）"""
+    return jsonify({"note": "清洗数据存储在 OSS，通过 CPI 趋势查看数据"})
 
 
 @app.route('/api/info')
@@ -145,19 +114,11 @@ def api_info():
     client = None
     try:
         client = _get_client()
-        r = client.execute("SELECT min(sale_date), max(sale_date), count(DISTINCT sale_date) FROM sales_clean")
-        min_d, max_d, days = r[0]
         r2 = client.execute("SELECT min(date), max(date) FROM cpi_trend WHERE category_id = 0")
         cpi_min, cpi_max = r2[0]
-        # 排除 1970-01-01（空表时的默认值）
         cpi_min_valid = str(cpi_min) if cpi_min and str(cpi_min) != '1970-01-01' else None
         cpi_max_valid = str(cpi_max) if cpi_max and str(cpi_max) != '1970-01-01' else None
         return jsonify({
-            'sales_clean': {
-                'min_date': str(min_d) if min_d else None,
-                'max_date': str(max_d) if max_d else None,
-                'days': days,
-            },
             'cpi_trend': {
                 'min_date': cpi_min_valid,
                 'max_date': cpi_max_valid,

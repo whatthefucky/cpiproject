@@ -412,9 +412,6 @@
                 if (info.cpi_trend.min_date && info.cpi_trend.max_date) {
                     dataRange.min_date = info.cpi_trend.min_date;
                     dataRange.max_date = info.cpi_trend.max_date;
-                } else if (info.sales_clean.min_date && info.sales_clean.max_date) {
-                    dataRange.min_date = info.sales_clean.min_date;
-                    dataRange.max_date = info.sales_clean.max_date;
                 }
                 document.getElementById('baseDate').value = dataRange.min_date;
                 document.getElementById('startDate').value = dataRange.min_date;

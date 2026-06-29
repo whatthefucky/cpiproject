@@ -1,16 +1,53 @@
 """
-SQL CPI 计算模块 — 直接在 ClickHouse 中用 SQL 计算费雪指数
+SQL CPI 计算模块 — 用 CK SQL 从 OSS 已清洗 CSV 读取数据，计算费雪指数
 拉氏 = Σ(Pi/Pi0 × qi0) / Σ(qi0)    基期加权
 帕氏 = Σ(Pi/Pi0 × qit) / Σ(qit)    当期加权
 费雪 = √(拉氏 × 帕氏)              几何平均
 结果写回 CK cpi_trend
+
+清洗后数据存储在 OSS（CK 不存），CPI 通过 oss() 函数直读计算
 """
 import sys, os, re
 from datetime import datetime, timedelta, date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from clickhouse_driver import Client
-from config import get_database_config
+from src.db.connection import get_clickhouse
+from config import get_database_config, get_oss_config
+
+# OSS 配置（用于构建已清洗 CSV 的 oss() 读取路径）
+OSS_CFG = get_oss_config()
+OSS_AK = OSS_CFG['access_key_id']
+OSS_SK = OSS_CFG['access_key_secret']
+OSS_BUCKET = OSS_CFG['bucket']
+OSS_ENDPOINT = OSS_CFG['endpoint'].rstrip('/')
+_region_match = re.search(r'oss-([a-z]+-[a-z0-9-]+)', OSS_ENDPOINT)
+OSS_REGION = _region_match.group(0) if _region_match else 'oss-cn-hangzhou'
+OSS_CLEAN_PREFIX = 'ecommerce/sales_clean/'
+
+
+def _clean_oss_url(ds):
+    """构建已清洗 CSV 的 oss() 内网读取 URL"""
+    ym = ds[:7].replace('-', '')
+    return f"http://{OSS_BUCKET}.{OSS_REGION}-internal.aliyuncs.com/{OSS_CLEAN_PREFIX}{ym}/{ds}.csv"
+
+
+def _build_oss_clean_table(period_start, period_end):
+    """生成 UNION ALL 从 OSS 已清洗 CSV 读取数据的子查询（用作 FROM 表）"""
+    oss_parts = []
+    d = period_start
+    while d <= period_end:
+        ds = d.isoformat()
+        url = _clean_oss_url(ds)
+        oss_parts.append(
+            f"SELECT toUInt64(s.product_id) pid, toDate(s.sale_date) sale_date, "
+            f"toFloat64(s.price) price, toInt32(toFloat64OrZero(s.sales_volume)) sales_volume, "
+            f"toUInt8(s.is_missing) is_missing "
+            f"FROM oss('{url}', '{OSS_AK}', '{OSS_SK}', 'CSVWithNames', "
+            f"'product_id String, sale_date String, sales_volume String, price String, "
+            f"revenue String, is_missing String, event_type String, day_type String') s"
+        )
+        d += timedelta(days=1)
+    return ' UNION ALL '.join(oss_parts)
 
 
 def get_granularity(start_date, end_date):
@@ -30,18 +67,11 @@ def _existing_cpi_dates(client):
 def compute_cpi_sql(base_date, start_date, end_date, force=False):
     """
     用 SQL 计算 CPI 趋势（全层级：总体 + 二级类目 + 叶子类目）
-    结果写入 cpi_trend + 导出到 OSS
+    结果写入 cpi_trend
     """
-    client = Client(
-        host=get_database_config()['host'],
-        port=get_database_config()['port'],
-        user=get_database_config()['user'],
-        password=get_database_config()['password'],
-        database=get_database_config()['database'],
-        connect_timeout=10, send_receive_timeout=300,
-        settings={'max_query_size': 10000000, 'allow_experimental_analyzer': 0,
-                  'allow_experimental_query_deduplication': 0}
-    )
+    client = get_clickhouse()
+    if client is None:
+        raise ConnectionError(f"无法连接 {db['host']}")
 
     granularity = get_granularity(start_date, end_date)
     print(f"  粒度: {granularity} (跨度 { (end_date - start_date).days } 天)")
@@ -105,21 +135,30 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
     total_periods = 0
     total_rows = 0
 
+    # 预构建基期数据的 OSS 子查询（基期固定为 1 天）
+    base_oss_table = _build_oss_clean_table(base_date, base_date)
+
     for p_idx, period_date in enumerate(pending):
         # 获取该周期对应的实际数据日期范围
         if granularity == 'month':
-            ym = period_date.strftime('%Y-%m')
-            date_filter = f"toYYYYMM(sale_date) = {period_date.year * 100 + period_date.month}"
-            period_label = period_date.isoformat()  # 用当月第一天 (YYYY-MM-DD)
+            # 当月第一天到最后一天
+            period_start = period_date
+            if period_date.month == 12:
+                period_end = period_date.replace(year=period_date.year + 1, month=1, day=1) - timedelta(days=1)
+            else:
+                period_end = period_date.replace(month=period_date.month + 1, day=1) - timedelta(days=1)
+            date_desc = period_date.strftime('%Y-%m')
         elif granularity == 'week':
-            start_w = period_date
-            end_w = period_date + timedelta(days=6)
-            date_filter = f"sale_date BETWEEN '{start_w.isoformat()}' AND '{end_w.isoformat()}'"
-            period_label = start_w.isoformat()
+            period_start = period_date
+            period_end = period_date + timedelta(days=6)
+            date_desc = period_start.isoformat()
         else:
-            ds = period_date.isoformat()
-            date_filter = f"sale_date = '{ds}'"
-            period_label = ds
+            period_start = period_date
+            period_end = period_date
+            date_desc = period_date.isoformat()
+
+        period_label = period_date.isoformat()
+        cur_oss_table = _build_oss_clean_table(period_start, period_end)
 
         # === 总体 CPI（category_id=0）===
         sql_overall = f"""
@@ -140,22 +179,24 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
                 SUM(cur_price / base_price * cur_qty) AS sum_p,
                 count() AS product_count
             FROM (
-                SELECT b.product_id, b.base_price, b.base_qty, c.cur_price, c.cur_qty
+                SELECT b.pid, b.base_price, b.base_qty, c.cur_price, c.cur_qty
                 FROM (
-                    SELECT product_id, AVG(price) AS base_price, SUM(sales_volume) AS base_qty
-                    FROM sales_clean
-                    WHERE sale_date = '{base_ds}' AND is_missing = 0 AND sales_volume > 0
-                    GROUP BY product_id
+                    SELECT pid, AVG(price) AS base_price, SUM(sales_volume) AS base_qty
+                    FROM ({base_oss_table})
+                    WHERE is_missing = 0 AND sales_volume > 0
+                    GROUP BY pid
                 ) b
                 INNER JOIN (
-                    SELECT product_id, AVG(price) AS cur_price, SUM(sales_volume) AS cur_qty
-                    FROM sales_clean
-                    WHERE {date_filter} AND is_missing = 0 AND sales_volume > 0
-                    GROUP BY product_id
-                ) c ON b.product_id = c.product_id
+                    SELECT pid, AVG(price) AS cur_price, SUM(sales_volume) AS cur_qty
+                    FROM ({cur_oss_table})
+                    WHERE is_missing = 0 AND sales_volume > 0
+                    GROUP BY pid
+                ) c ON b.pid = c.pid
             ) m
         ) agg
         HAVING product_count > 0
+        SETTINGS joined_subquery_requires_alias = 0,
+                 allow_experimental_analyzer = 0
         """
         try:
             client.execute(sql_overall)
@@ -178,22 +219,22 @@ def compute_cpi_sql(base_date, start_date, end_date, force=False):
                 cat.category_id,
                 '{granularity}' AS granularity
             FROM (
-                SELECT b.product_id, b.base_price, b.base_qty,
+                SELECT b.pid, b.base_price, b.base_qty,
                        c.cur_price, c.cur_qty
                 FROM (
-                    SELECT product_id, AVG(price) AS base_price, SUM(sales_volume) AS base_qty
-                    FROM sales_clean
-                    WHERE sale_date = '{base_ds}' AND is_missing = 0 AND sales_volume > 0
-                    GROUP BY product_id
+                    SELECT pid, AVG(price) AS base_price, SUM(sales_volume) AS base_qty
+                    FROM ({base_oss_table})
+                    WHERE is_missing = 0 AND sales_volume > 0
+                    GROUP BY pid
                 ) b
                 INNER JOIN (
-                    SELECT product_id, AVG(price) AS cur_price, SUM(sales_volume) AS cur_qty
-                    FROM sales_clean
-                    WHERE {date_filter} AND is_missing = 0 AND sales_volume > 0
-                    GROUP BY product_id
-                ) c ON b.product_id = c.product_id
+                    SELECT pid, AVG(price) AS cur_price, SUM(sales_volume) AS cur_qty
+                    FROM ({cur_oss_table})
+                    WHERE is_missing = 0 AND sales_volume > 0
+                    GROUP BY pid
+                ) c ON b.pid = c.pid
             ) m
-            INNER JOIN product_category_map cat ON m.product_id = cat.product_id
+            INNER JOIN product_category_map cat ON m.pid = cat.product_id
             GROUP BY cat.category_id
             SETTINGS joined_subquery_requires_alias = 0,
                      allow_experimental_analyzer = 0
